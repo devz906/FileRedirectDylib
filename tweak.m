@@ -2,7 +2,7 @@
  * FileRedirectDylib - tweak.m
  *
  * Hooks file-access functions so that when the game reads from its .app bundle,
- * it checks Documents/disk/ first. If a replacement file exists there, the
+ * it checks the Documents folder first. If a replacement file exists there, the
  * hooked function transparently returns that path instead.
  *
  * Works on non-jailbroken iOS (sideloaded IPAs) using Facebook's fishhook
@@ -11,9 +11,9 @@
  * Usage:
  *   1. Build as a dylib for iOS arm64.
  *   2. Inject into the target IPA (insert_dylib / optool).
- *   3. Place your modded game files in:
- *        <AppContainer>/Documents/disk/
- *      mirroring the directory structure of the .app bundle.
+ *   3. Place your modded game files in Documents/, mirroring the .app structure.
+ *      For Bully:  Documents/BullyOrig/Scripts/yourscript.sc
+ *      For GTA SA: Documents/texdb/gta3.txd  (or whatever path the file has in .app)
  *   4. The game will transparently load your files instead of the originals.
  */
 
@@ -31,9 +31,8 @@
 // Globals
 // ---------------------------------------------------------------------------
 
-static NSString *g_bundlePath  = nil;   // e.g. /var/containers/…/MyApp.app
+static NSString *g_bundlePath    = nil; // e.g. /var/containers/…/MyApp.app
 static NSString *g_documentsPath = nil; // e.g. /var/containers/…/Documents
-static NSString *g_diskPath    = nil;   // e.g. /var/containers/…/Documents/disk
 
 // Set to 1 to log every redirected access (useful for debugging).
 // In production you probably want this off (0).
@@ -52,14 +51,14 @@ static void redirect_log(const char *func, const char *original, const char *red
 // ---------------------------------------------------------------------------
 
 static const char *redirected_path_if_exists(const char *path) {
-    if (!path || !g_bundlePath || !g_diskPath) return NULL;
+    if (!path || !g_bundlePath || !g_documentsPath) return NULL;
 
     NSString *nsPath = [NSString stringWithUTF8String:path];
     if (![nsPath hasPrefix:g_bundlePath]) return NULL;
 
-    // Strip the bundle prefix and prepend the disk path
+    // Strip the bundle prefix and prepend the Documents path
     NSString *relative = [nsPath substringFromIndex:[g_bundlePath length]];
-    NSString *candidate = [g_diskPath stringByAppendingString:relative];
+    NSString *candidate = [g_documentsPath stringByAppendingString:relative];
 
     // Check existence
     if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
@@ -70,11 +69,11 @@ static const char *redirected_path_if_exists(const char *path) {
 
 // Same helper but returns an NSString (for ObjC hooks)
 static NSString *redirected_nspath_if_exists(NSString *path) {
-    if (!path || !g_bundlePath || !g_diskPath) return nil;
+    if (!path || !g_bundlePath || !g_documentsPath) return nil;
     if (![path hasPrefix:g_bundlePath]) return nil;
 
     NSString *relative = [path substringFromIndex:[g_bundlePath length]];
-    NSString *candidate = [g_diskPath stringByAppendingString:relative];
+    NSString *candidate = [g_documentsPath stringByAppendingString:relative];
 
     if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
         return candidate;
@@ -231,25 +230,24 @@ static void file_redirect_init(void) {
         NSArray *docPaths = NSSearchPathForDirectoriesInDomains(
             NSDocumentDirectory, NSUserDomainMask, YES);
         g_documentsPath = [docPaths firstObject];
-        g_diskPath      = [g_documentsPath stringByAppendingPathComponent:@"disk"];
 
         NSLog(@"[FileRedirect] === Initializing ===");
         NSLog(@"[FileRedirect] Bundle path:    %@", g_bundlePath);
         NSLog(@"[FileRedirect] Documents path: %@", g_documentsPath);
-        NSLog(@"[FileRedirect] Disk path:      %@", g_diskPath);
 
-        // Create the disk folder if it doesn't exist
+        // Auto-create BullyOrig/Scripts/ in Documents for convenience
         NSFileManager *fm = [NSFileManager defaultManager];
-        if (![fm fileExistsAtPath:g_diskPath]) {
+        NSString *bullyScripts = [g_documentsPath stringByAppendingPathComponent:@"BullyOrig/Scripts"];
+        if (![fm fileExistsAtPath:bullyScripts]) {
             NSError *err = nil;
-            [fm createDirectoryAtPath:g_diskPath
+            [fm createDirectoryAtPath:bullyScripts
           withIntermediateDirectories:YES
                            attributes:nil
                                 error:&err];
             if (err) {
-                NSLog(@"[FileRedirect] Failed to create disk dir: %@", err);
+                NSLog(@"[FileRedirect] Failed to create BullyOrig/Scripts: %@", err);
             } else {
-                NSLog(@"[FileRedirect] Created disk directory at %@", g_diskPath);
+                NSLog(@"[FileRedirect] Created Documents/BullyOrig/Scripts/");
             }
         }
 
@@ -280,6 +278,6 @@ static void file_redirect_init(void) {
             @selector(fr_contentsAtPath:));
 
         NSLog(@"[FileRedirect] ObjC swizzles installed (NSBundle, NSFileManager)");
-        NSLog(@"[FileRedirect] === Ready! Place mod files in Documents/disk/ ===");
+        NSLog(@"[FileRedirect] === Ready! Place mod files in Documents/ (e.g. Documents/BullyOrig/Scripts/) ===");
     }
 }
