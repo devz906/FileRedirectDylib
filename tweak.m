@@ -12,8 +12,12 @@
  *   1. Build as a dylib for iOS arm64.
  *   2. Inject into the target IPA (insert_dylib / optool).
  *   3. Place your modded game files in Documents/, mirroring the .app structure.
- *      For Bully:  Documents/BullyOrig/Scripts/yourscript.sc
+ *      For Bully:  Documents/BullyOrig/Scripts/scripts.img + scripts.dir
  *      For GTA SA: Documents/texdb/gta3.txd  (or whatever path the file has in .app)
+ *
+ *   Bully-specific: The .app has BullyOrig as a zip file. This dylib makes
+ *   the game see your Documents/BullyOrig/ folder instead of that zip, so
+ *   the engine loads your modded scripts.img/scripts.dir from there.
  *   4. The game will transparently load your files instead of the originals.
  */
 
@@ -24,6 +28,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include "fishhook.h"
 
@@ -134,6 +139,28 @@ static int hook_access(const char *path, int amode) {
         return orig_access(redir, amode);
     }
     return orig_access(path, amode);
+}
+
+// ---- lstat (some engines use lstat instead of stat) ----
+static int (*orig_lstat)(const char *, struct stat *);
+static int hook_lstat(const char *path, struct stat *buf) {
+    const char *redir = redirected_path_if_exists(path);
+    if (redir) {
+        redirect_log("lstat", path, redir);
+        return orig_lstat(redir, buf);
+    }
+    return orig_lstat(path, buf);
+}
+
+// ---- opendir (critical for Bully: makes BullyOrig look like a folder) ----
+static DIR *(*orig_opendir)(const char *);
+static DIR *hook_opendir(const char *path) {
+    const char *redir = redirected_path_if_exists(path);
+    if (redir) {
+        redirect_log("opendir", path, redir);
+        return orig_opendir(redir);
+    }
+    return orig_opendir(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -253,13 +280,15 @@ static void file_redirect_init(void) {
 
         // ---- C-level hooks via fishhook ----
         struct rebinding rebindings[] = {
-            {"fopen",  (void *)hook_fopen,  (void **)&orig_fopen},
-            {"open",   (void *)hook_open,   (void **)&orig_open},
-            {"stat",   (void *)hook_stat,   (void **)&orig_stat},
-            {"access", (void *)hook_access, (void **)&orig_access},
+            {"fopen",   (void *)hook_fopen,   (void **)&orig_fopen},
+            {"open",    (void *)hook_open,    (void **)&orig_open},
+            {"stat",    (void *)hook_stat,    (void **)&orig_stat},
+            {"lstat",   (void *)hook_lstat,   (void **)&orig_lstat},
+            {"access",  (void *)hook_access,  (void **)&orig_access},
+            {"opendir", (void *)hook_opendir, (void **)&orig_opendir},
         };
         rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
-        NSLog(@"[FileRedirect] C hooks installed (fopen, open, stat, access)");
+        NSLog(@"[FileRedirect] C hooks installed (fopen, open, stat, lstat, access, opendir)");
 
         // ---- ObjC swizzles ----
         swizzle_instance_method(
