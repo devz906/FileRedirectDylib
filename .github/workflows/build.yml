@@ -1,0 +1,40 @@
+name: Build FileRedirect.dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14          # Apple Silicon runner (has Xcode 15+)
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Show iOS SDK path
+        run: xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib
+        run: make
+        working-directory: .
+
+      - name: Verify output
+        run: |
+          ls -la FileRedirect.dylib
+          file FileRedirect.dylib
+          otool -l FileRedirect.dylib | head -40
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileRedirect-dylib
+          path: FileRedirect.dylib
+          retention-days: 90

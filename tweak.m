@@ -1,0 +1,285 @@
+/*
+ * FileRedirectDylib - tweak.m
+ *
+ * Hooks file-access functions so that when the game reads from its .app bundle,
+ * it checks Documents/disk/ first. If a replacement file exists there, the
+ * hooked function transparently returns that path instead.
+ *
+ * Works on non-jailbroken iOS (sideloaded IPAs) using Facebook's fishhook
+ * for C-level hooks and ObjC method swizzling for NSBundle/NSFileManager.
+ *
+ * Usage:
+ *   1. Build as a dylib for iOS arm64.
+ *   2. Inject into the target IPA (insert_dylib / optool).
+ *   3. Place your modded game files in:
+ *        <AppContainer>/Documents/disk/
+ *      mirroring the directory structure of the .app bundle.
+ *   4. The game will transparently load your files instead of the originals.
+ */
+
+#import <Foundation/Foundation.h>
+#import <objc/runtime.h>
+#include <stdio.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include "fishhook.h"
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+
+static NSString *g_bundlePath  = nil;   // e.g. /var/containers/…/MyApp.app
+static NSString *g_documentsPath = nil; // e.g. /var/containers/…/Documents
+static NSString *g_diskPath    = nil;   // e.g. /var/containers/…/Documents/disk
+
+// Set to 1 to log every redirected access (useful for debugging).
+// In production you probably want this off (0).
+#define REDIRECT_LOG_ENABLED 1
+
+static void redirect_log(const char *func, const char *original, const char *redirected) {
+#if REDIRECT_LOG_ENABLED
+    NSLog(@"[FileRedirect] %s: %s -> %s", func, original, redirected);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Helper: given an absolute path that lives inside the .app bundle, return
+// the equivalent path under Documents/disk/ — or NULL if the replacement
+// file does not exist.
+// ---------------------------------------------------------------------------
+
+static const char *redirected_path_if_exists(const char *path) {
+    if (!path || !g_bundlePath || !g_diskPath) return NULL;
+
+    NSString *nsPath = [NSString stringWithUTF8String:path];
+    if (![nsPath hasPrefix:g_bundlePath]) return NULL;
+
+    // Strip the bundle prefix and prepend the disk path
+    NSString *relative = [nsPath substringFromIndex:[g_bundlePath length]];
+    NSString *candidate = [g_diskPath stringByAppendingString:relative];
+
+    // Check existence
+    if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+        return [candidate UTF8String];
+    }
+    return NULL;
+}
+
+// Same helper but returns an NSString (for ObjC hooks)
+static NSString *redirected_nspath_if_exists(NSString *path) {
+    if (!path || !g_bundlePath || !g_diskPath) return nil;
+    if (![path hasPrefix:g_bundlePath]) return nil;
+
+    NSString *relative = [path substringFromIndex:[g_bundlePath length]];
+    NSString *candidate = [g_diskPath stringByAppendingString:relative];
+
+    if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+        return candidate;
+    }
+    return nil;
+}
+
+// ---------------------------------------------------------------------------
+// C-level hooks (via fishhook)
+// ---------------------------------------------------------------------------
+
+// ---- fopen ----
+static FILE *(*orig_fopen)(const char *, const char *);
+static FILE *hook_fopen(const char *path, const char *mode) {
+    const char *redir = redirected_path_if_exists(path);
+    if (redir) {
+        redirect_log("fopen", path, redir);
+        return orig_fopen(redir, mode);
+    }
+    return orig_fopen(path, mode);
+}
+
+// ---- open ----
+static int (*orig_open)(const char *, int, ...);
+static int hook_open(const char *path, int flags, ...) {
+    const char *redir = redirected_path_if_exists(path);
+    const char *use_path = redir ? redir : path;
+    if (redir) redirect_log("open", path, redir);
+
+    // Handle optional mode_t argument (used with O_CREAT)
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode_t mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+        return orig_open(use_path, flags, mode);
+    }
+    return orig_open(use_path, flags);
+}
+
+// ---- stat ----
+static int (*orig_stat)(const char *, struct stat *);
+static int hook_stat(const char *path, struct stat *buf) {
+    const char *redir = redirected_path_if_exists(path);
+    if (redir) {
+        redirect_log("stat", path, redir);
+        return orig_stat(redir, buf);
+    }
+    return orig_stat(path, buf);
+}
+
+// ---- access ----
+static int (*orig_access)(const char *, int);
+static int hook_access(const char *path, int amode) {
+    const char *redir = redirected_path_if_exists(path);
+    if (redir) {
+        redirect_log("access", path, redir);
+        return orig_access(redir, amode);
+    }
+    return orig_access(path, amode);
+}
+
+// ---------------------------------------------------------------------------
+// ObjC swizzling helpers
+// ---------------------------------------------------------------------------
+
+static void swizzle_instance_method(Class cls, SEL orig, SEL replacement) {
+    Method origMethod = class_getInstanceMethod(cls, orig);
+    Method replMethod = class_getInstanceMethod(cls, replacement);
+    if (class_addMethod(cls, orig,
+                        method_getImplementation(replMethod),
+                        method_getTypeEncoding(replMethod))) {
+        class_replaceMethod(cls, replacement,
+                            method_getImplementation(origMethod),
+                            method_getTypeEncoding(origMethod));
+    } else {
+        method_exchangeImplementations(origMethod, replMethod);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NSBundle swizzle: -pathForResource:ofType:
+// ---------------------------------------------------------------------------
+
+@interface NSBundle (FileRedirect)
+- (NSString *)fr_pathForResource:(NSString *)name ofType:(NSString *)ext;
+@end
+
+@implementation NSBundle (FileRedirect)
+- (NSString *)fr_pathForResource:(NSString *)name ofType:(NSString *)ext {
+    // Call original
+    NSString *original = [self fr_pathForResource:name ofType:ext];
+    if (!original) return nil;
+
+    NSString *redir = redirected_nspath_if_exists(original);
+    if (redir) {
+        NSLog(@"[FileRedirect] NSBundle pathForResource: %@ -> %@", original, redir);
+        return redir;
+    }
+    return original;
+}
+@end
+
+// ---------------------------------------------------------------------------
+// NSBundle swizzle: -pathForResource:ofType:inDirectory:
+// ---------------------------------------------------------------------------
+
+@interface NSBundle (FileRedirect2)
+- (NSString *)fr_pathForResource:(NSString *)name ofType:(NSString *)ext inDirectory:(NSString *)subpath;
+@end
+
+@implementation NSBundle (FileRedirect2)
+- (NSString *)fr_pathForResource:(NSString *)name ofType:(NSString *)ext inDirectory:(NSString *)subpath {
+    NSString *original = [self fr_pathForResource:name ofType:ext inDirectory:subpath];
+    if (!original) return nil;
+
+    NSString *redir = redirected_nspath_if_exists(original);
+    if (redir) {
+        NSLog(@"[FileRedirect] NSBundle pathForResource:ofType:inDirectory: %@ -> %@", original, redir);
+        return redir;
+    }
+    return original;
+}
+@end
+
+// ---------------------------------------------------------------------------
+// NSFileManager swizzle: -contentsAtPath:
+// ---------------------------------------------------------------------------
+
+@interface NSFileManager (FileRedirect)
+- (NSData *)fr_contentsAtPath:(NSString *)path;
+@end
+
+@implementation NSFileManager (FileRedirect)
+- (NSData *)fr_contentsAtPath:(NSString *)path {
+    NSString *redir = redirected_nspath_if_exists(path);
+    if (redir) {
+        NSLog(@"[FileRedirect] NSFileManager contentsAtPath: %@ -> %@", path, redir);
+        return [self fr_contentsAtPath:redir];
+    }
+    return [self fr_contentsAtPath:path];
+}
+@end
+
+// ---------------------------------------------------------------------------
+// Constructor — runs automatically when the dylib is loaded
+// ---------------------------------------------------------------------------
+
+__attribute__((constructor))
+static void file_redirect_init(void) {
+    @autoreleasepool {
+        // Resolve paths
+        g_bundlePath    = [[NSBundle mainBundle] bundlePath];
+        NSArray *docPaths = NSSearchPathForDirectoriesInDomains(
+            NSDocumentDirectory, NSUserDomainMask, YES);
+        g_documentsPath = [docPaths firstObject];
+        g_diskPath      = [g_documentsPath stringByAppendingPathComponent:@"disk"];
+
+        NSLog(@"[FileRedirect] === Initializing ===");
+        NSLog(@"[FileRedirect] Bundle path:    %@", g_bundlePath);
+        NSLog(@"[FileRedirect] Documents path: %@", g_documentsPath);
+        NSLog(@"[FileRedirect] Disk path:      %@", g_diskPath);
+
+        // Create the disk folder if it doesn't exist
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:g_diskPath]) {
+            NSError *err = nil;
+            [fm createDirectoryAtPath:g_diskPath
+          withIntermediateDirectories:YES
+                           attributes:nil
+                                error:&err];
+            if (err) {
+                NSLog(@"[FileRedirect] Failed to create disk dir: %@", err);
+            } else {
+                NSLog(@"[FileRedirect] Created disk directory at %@", g_diskPath);
+            }
+        }
+
+        // ---- C-level hooks via fishhook ----
+        struct rebinding rebindings[] = {
+            {"fopen",  (void *)hook_fopen,  (void **)&orig_fopen},
+            {"open",   (void *)hook_open,   (void **)&orig_open},
+            {"stat",   (void *)hook_stat,   (void **)&orig_stat},
+            {"access", (void *)hook_access, (void **)&orig_access},
+        };
+        rebind_symbols(rebindings, sizeof(rebindings) / sizeof(rebindings[0]));
+        NSLog(@"[FileRedirect] C hooks installed (fopen, open, stat, access)");
+
+        // ---- ObjC swizzles ----
+        swizzle_instance_method(
+            [NSBundle class],
+            @selector(pathForResource:ofType:),
+            @selector(fr_pathForResource:ofType:));
+
+        swizzle_instance_method(
+            [NSBundle class],
+            @selector(pathForResource:ofType:inDirectory:),
+            @selector(fr_pathForResource:ofType:inDirectory:));
+
+        swizzle_instance_method(
+            [NSFileManager class],
+            @selector(contentsAtPath:),
+            @selector(fr_contentsAtPath:));
+
+        NSLog(@"[FileRedirect] ObjC swizzles installed (NSBundle, NSFileManager)");
+        NSLog(@"[FileRedirect] === Ready! Place mod files in Documents/disk/ ===");
+    }
+}
